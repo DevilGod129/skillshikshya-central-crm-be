@@ -552,3 +552,21 @@ class GlobalCallSummaryEdgeTests(APITestCase):
         for _ in range(30):
             self._call(now)
         self.assertEqual(count_queries(), few)
+
+class GlobalCallSearchTests(APITestCase):
+    def test_search_finds_calls_by_logging_user_name(self):
+        from django.utils import timezone
+        from apps.lead.models import LeadCall
+
+        sita = User.objects.create_user(
+            email='sita@test.com', name='Sita Rai', password='pass', is_staff=True,
+        )
+        lead = Lead.objects.create(full_name='Search Lead', phone='9888888888')
+        call = LeadCall.objects.create(
+            lead=lead, call_timestamp=timezone.now(), direction='outbound',
+            caller=str(sita.pk), phone_number='9888888888', duration_seconds=30,
+            created_by=sita,
+        )
+        self.client.force_authenticate(sita)
+        response = self.client.get('/api/calls/?search=Sita')
+        self.assertEqual([r['id'] for r in response.data['results']], [call.id])
