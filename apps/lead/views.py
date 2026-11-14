@@ -1,6 +1,9 @@
 import csv
 from datetime import datetime
 
+from django.contrib.auth import get_user_model
+from django.db.models import ( Count, Q , Sum )
+from django.db.models.functions import TruncDate
 from django.http import HttpResponse
 from django.utils import timezone
 
@@ -12,6 +15,7 @@ from rest_framework.response import Response
 
 from django_filters.rest_framework import DjangoFilterBackend
 
+from apps.lead.tasks import NEPAL_TZ
 from apps.lead.models import (
     LearningMode, Institution, Province, City, LeadSource, Campaign, LeadStatus, LeadPriority,
     LeadTag, LeadType, Lead, LeadCourseInterest, Enrollment, Payment,
@@ -37,7 +41,7 @@ from apps.lead.filters import (
     LeadCourseInterestFilter, EnrollmentFilter, PaymentFilter,
     LeadCallFilter, LeadActivityFilter, FollowUpFilter, LeadDocumentFilter,
     NotificationFilter,
-    GlobalEnrollmentFilter, GlobalPaymentFilter, GlobalCallFilter,
+    GlobalEnrollmentFilter, GlobalPaymentFilter, GlobalCallFilter
 )
 from apps.global_config.pagination import CustomPagination
 from apps.global_config.permissions import IsStaffOrHasPermission
@@ -298,9 +302,82 @@ class GlobalCallViewSet(viewsets.ReadOnlyModelViewSet):
         )
 
     def get_permissions(self):
-        if self.action in ['list', 'retrieve']:
+        if self.action in ['list', 'retrieve','summary','export']:
             return [IsAuthenticated()]
         return [IsAuthenticated(), IsStaffOrHasPermission()]
+
+    @action(detail=False, methods=['get'])
+    def summary(self, request):
+        qs = self.filter_queryset(self.get_queryset()).order_by()
+
+        totals = qs.aggregate(
+            total=Count('id'),
+            inbound=Count('id', filter=Q(direction='inbound')),
+            outbound=Count('id', filter=Q(direction='outbound')),
+            connected=Count('id', filter=Q(duration_seconds__gt=0)),
+            talk_seconds=Sum('duration_seconds'),
+        )
+
+        total = totals['total']
+        talk = totals['talk_seconds'] or 0
+
+        per_day = (
+            qs.annotate(day=TruncDate('call_timestamp', tzinfo=NEPAL_TZ))
+            .values('day')
+            .annotate(count=Count('id'))
+            .order_by('day')
+        )
+
+        caller_rows = list(
+            qs.values('caller')
+            .annotate(count=Count('id'))
+            .order_by('-count', 'caller')[:10]
+        )
+
+        # Resolve numeric caller IDs to readable user names.
+        caller_ids = [
+            int(row['caller'])
+            for row in caller_rows
+            if row['caller'].isdigit()
+        ]
+
+        User = get_user_model()
+
+        caller_names = dict(
+            User.objects.filter(pk__in=caller_ids)
+            .values_list('pk', 'name')
+        )
+
+        top_callers = [
+            {
+                'caller_id': row['caller'],
+                'caller': caller_names.get(
+                    int(row['caller']), row['caller']
+                ) if row['caller'].isdigit() else row['caller'],
+                'count': row['count'],
+            }
+            for row in caller_rows
+        ]
+
+        return Response({
+            'total_calls': total,
+            'inbound_calls': totals['inbound'],
+            'outbound_calls': totals['outbound'],
+            'talk_seconds': talk,
+            'avg_duration_seconds': round(talk / total) if total else 0,
+            'connected_calls': totals['connected'],
+            'connect_rate': round(
+                totals['connected'] * 100 / total, 1
+            ) if total else 0,
+            'calls_per_day': [
+                {
+                    'date': row['day'].isoformat(),
+                    'count': row['count'],
+                }
+                for row in per_day
+            ],
+            'top_callers': top_callers,
+        })
 
 
 class NotificationViewSet(viewsets.ModelViewSet):
