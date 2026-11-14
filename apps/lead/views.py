@@ -1,5 +1,4 @@
 import csv
-from datetime import datetime
 
 from django.contrib.auth import get_user_model
 from django.db.models import ( Count, Q , Sum )
@@ -282,6 +281,40 @@ class GlobalPaymentViewSet(viewsets.ReadOnlyModelViewSet):
         return [IsAuthenticated(), IsStaffOrHasPermission()]
 
 
+CSV_FORMULA_PREFIXES = ('=', '+', '-', '@', '\t', '\r')
+
+
+def csv_safe(value):
+    """Stop spreadsheet apps from running a text cell as a formula."""
+    if value is None:
+        return ''
+    text = str(value)
+    if text.startswith(CSV_FORMULA_PREFIXES):
+        return "'" + text
+    return text
+
+
+def resolve_caller_names(caller_values):
+    """Map caller values to display names.
+
+    Numeric values are treated as user IDs. Other values are
+    already names and can be displayed as they are.
+    """
+    ids = {
+    int(v) for v in caller_values
+    if v and str(v).isascii() and str(v).isdigit() and len(str(v)) <= 9
+    }
+    if not ids:
+        return {}
+
+    User = get_user_model()
+
+    return {
+        str(pk): name
+        for pk, name in User.objects.filter(pk__in=ids).values_list('pk', 'name')
+    }
+
+
 class GlobalCallViewSet(viewsets.ReadOnlyModelViewSet):
     """Flat, cross-lead call log. Newest calls first by default."""
     queryset = LeadCall.objects.none()
@@ -291,7 +324,7 @@ class GlobalCallViewSet(viewsets.ReadOnlyModelViewSet):
     filterset_class = GlobalCallFilter
     search_fields = [
         'caller', 'phone_number', 'outcome', 'notes', 'lead__full_name',
-        'lead__reference_number',
+        'lead__reference_number', 'created_by__name',
     ]
     ordering_fields = ['call_timestamp', 'duration_seconds', 'created_at']
     ordering = ['-call_timestamp']
@@ -302,7 +335,7 @@ class GlobalCallViewSet(viewsets.ReadOnlyModelViewSet):
         )
 
     def get_permissions(self):
-        if self.action in ['list', 'retrieve','summary','export']:
+        if self.action in ['list', 'retrieve', 'summary', 'export']:
             return [IsAuthenticated()]
         return [IsAuthenticated(), IsStaffOrHasPermission()]
 
@@ -328,32 +361,19 @@ class GlobalCallViewSet(viewsets.ReadOnlyModelViewSet):
             .order_by('day')
         )
 
+        
         caller_rows = list(
             qs.values('caller')
             .annotate(count=Count('id'))
             .order_by('-count', 'caller')[:10]
         )
 
-        # Resolve numeric caller IDs to readable user names.
-        caller_ids = [
-            int(row['caller'])
-            for row in caller_rows
-            if row['caller'].isdigit()
-        ]
-
-        User = get_user_model()
-
-        caller_names = dict(
-            User.objects.filter(pk__in=caller_ids)
-            .values_list('pk', 'name')
-        )
+        names = resolve_caller_names(row['caller'] for row in caller_rows)
 
         top_callers = [
             {
                 'caller_id': row['caller'],
-                'caller': caller_names.get(
-                    int(row['caller']), row['caller']
-                ) if row['caller'].isdigit() else row['caller'],
+                'caller': names.get(row['caller'], row['caller']),
                 'count': row['count'],
             }
             for row in caller_rows
