@@ -196,3 +196,77 @@ class GlobalCallListTests(APITestCase):
         self.client.force_authenticate(other_admin)
         response = self.client.get('/api/calls/')
         self.assertNotIn(self.recent_call.id, [r['id'] for r in response.data['results']])
+
+
+
+class GlobalCallBranchScopingTests(APITestCase):
+    """US-6: branch privacy for /api/calls/."""
+
+    def setUp(self):
+        from apps.branch.models import Branch
+        from apps.lead.models import LeadCall
+        from django.utils import timezone as tz
+
+        self.biratnagar = Branch.objects.create(name='Biratnagar', code='BRT')
+        self.dharan = Branch.objects.create(name='Dharan', code='DHR')
+
+        self.staff = User.objects.create_user(
+            email='staff@test.com', name='Staff', password='pass', is_staff=True,
+        )
+        self.dharan_user = User.objects.create_user(
+            email='dharan@test.com', name='Dharan User', password='pass',
+            branch=self.dharan,
+        )
+        self.biratnagar_user = User.objects.create_user(
+            email='birat@test.com', name='Birat User', password='pass',
+            branch=self.biratnagar,
+        )
+        self.lead = Lead.objects.create(full_name='Branch Lead', phone='9833333333')
+        now = tz.now()
+        self.dharan_call = LeadCall.objects.create(
+            lead=self.lead, call_timestamp=now, direction='outbound',
+            caller='Dharan User', phone_number='9833333333', duration_seconds=120,
+            created_by=self.dharan_user, branch=self.dharan,
+        )
+        self.biratnagar_call = LeadCall.objects.create(
+            lead=self.lead, call_timestamp=now, direction='inbound',
+            caller='Birat User', phone_number='9844444444', duration_seconds=60,
+            created_by=self.biratnagar_user, branch=self.biratnagar,
+        )
+
+    def _ids(self, response):
+        return [row['id'] for row in response.data['results']]
+
+    def test_non_staff_sees_only_own_branch_calls(self):
+        self.client.force_authenticate(self.dharan_user)
+        response = self.client.get('/api/calls/')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self._ids(response), [self.dharan_call.id])
+
+    def test_non_staff_cannot_override_branch_with_query_param(self):
+        self.client.force_authenticate(self.dharan_user)
+        response = self.client.get(f'/api/calls/?branch_id={self.biratnagar.id}')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self._ids(response), [self.dharan_call.id])
+
+    def test_staff_sees_all_branches_by_default(self):
+        self.client.force_authenticate(self.staff)
+        response = self.client.get('/api/calls/')
+        self.assertEqual(
+            sorted(self._ids(response)),
+            sorted([self.dharan_call.id, self.biratnagar_call.id]),
+        )
+
+    def test_staff_can_narrow_to_one_branch(self):
+        self.client.force_authenticate(self.staff)
+        response = self.client.get(f'/api/calls/?branch_id={self.biratnagar.id}')
+        self.assertEqual(self._ids(response), [self.biratnagar_call.id])
+
+    def test_non_staff_without_branch_currently_sees_all_calls(self):
+        """Documents a known gap from the US-6 write-up. Not fixed in this PR."""
+        no_branch = User.objects.create_user(
+            email='nobranch@test.com', name='No Branch', password='pass',
+        )
+        self.client.force_authenticate(no_branch)
+        response = self.client.get('/api/calls/')
+        self.assertEqual(response.data['count'], 2)
