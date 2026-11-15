@@ -570,3 +570,200 @@ class GlobalCallSearchTests(APITestCase):
         self.client.force_authenticate(sita)
         response = self.client.get('/api/calls/?search=Sita')
         self.assertEqual([r['id'] for r in response.data['results']], [call.id])
+    
+class GlobalCallExportTests(APITestCase):
+    """US-4: CSV export at /api/calls/export/."""
+
+    HEADER = [
+        'Date & time (NPT)', 'Direction', 'Lead', 'Reference', 'Phone',
+        'Caller', 'Logged by', 'Duration (MM:SS)', 'Seconds', 'Outcome',
+        'Notes', 'Recording',
+    ]
+
+    def setUp(self):
+        from apps.branch.models import Branch
+
+        self.dharan = Branch.objects.create(name='Dharan', code='DHR')
+        self.biratnagar = Branch.objects.create(name='Biratnagar', code='BRT')
+
+        self.staff = User.objects.create_user(
+            email='export-staff@test.com',
+            name='Sita Rai',
+            password='pass',
+            is_staff=True,
+        )
+
+        self.dharan_user = User.objects.create_user(
+            email='export-dharan@test.com',
+            name='Export Dharan',
+            password='pass',
+            branch=self.dharan,
+        )
+
+        self.lead = Lead.objects.create(
+            full_name='नेपाली नाम',
+            phone='9877777777',
+        )
+
+        self.client.force_authenticate(self.staff)
+
+    def _call(
+        self,
+        when=None,
+        branch=None,
+        seconds=60,
+        direction='outbound',
+        notes=None,
+        caller='Alice',
+    ):
+        from django.utils import timezone
+        from apps.lead.models import LeadCall
+
+        return LeadCall.objects.create(
+            lead=self.lead,
+            call_timestamp=when or timezone.now(),
+            direction=direction,
+            caller=caller,
+            phone_number='9877777777',
+            duration_seconds=seconds,
+            notes=notes,
+            created_by=self.staff,
+            branch=branch or self.dharan,
+        )
+
+    def _rows(self, response):
+        import csv
+        import io
+
+        return list(
+            csv.reader(
+                io.StringIO(response.content.decode('utf-8-sig'))
+            )
+        )
+
+    def test_headers_filename_and_columns(self):
+        self._call()
+
+        response = self.client.get('/api/calls/export/')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(
+            response['Content-Type'].startswith('text/csv')
+        )
+        self.assertRegex(
+            response['Content-Disposition'],
+            r'filename="calls-\d{4}-\d{2}-\d{2}\.csv"',
+        )
+        self.assertEqual(self._rows(response)[0], self.HEADER)
+
+    def test_devanagari_names_survive_and_bom_is_present(self):
+        self._call()
+
+        response = self.client.get('/api/calls/export/')
+
+        self.assertTrue(response.content.startswith(b'\xef\xbb\xbf'))
+        self.assertEqual(self._rows(response)[1][2], 'नेपाली नाम')
+
+    def test_formula_like_notes_are_neutralised(self):
+        for note in ['=1+1', '+1', '-2', '@SUM(A1)']:
+            self._call(notes=note)
+
+        cells = [
+            row[10]
+            for row in self._rows(
+                self.client.get('/api/calls/export/')
+            )[1:]
+        ]
+
+        self.assertEqual(len(cells), 4)
+
+        for cell in cells:
+            self.assertTrue(cell.startswith("'"), cell)
+
+    def test_row_values_use_nepal_time_and_readable_names(self):
+        from datetime import datetime
+        from apps.lead.tasks import NEPAL_TZ
+
+        self._call(
+            when=datetime(2026, 11, 15, 1, 0, tzinfo=NEPAL_TZ),
+            seconds=259,
+            caller=str(self.staff.pk),
+        )
+
+        row = self._rows(
+            self.client.get('/api/calls/export/')
+        )[1]
+
+        self.assertEqual(row[0], '2026-11-15 01:00:00')
+        self.assertEqual(row[1], 'Outbound')
+        self.assertEqual(row[5], 'Sita Rai')
+        self.assertEqual(row[6], 'Sita Rai')
+        self.assertEqual(row[7], '04:19')
+        self.assertEqual(row[8], '259')
+
+    def test_export_matches_list_for_same_filters(self):
+        for direction in ('outbound', 'inbound', 'outbound'):
+            self._call(direction=direction)
+
+        query = '?direction=outbound'
+
+        listing = self.client.get(f'/api/calls/{query}')
+        export = self.client.get(f'/api/calls/export/{query}')
+
+        self.assertEqual(listing.data['count'], 2)
+        self.assertEqual(
+            len(self._rows(export)) - 1,
+            listing.data['count'],
+        )
+
+    def test_export_includes_every_page_of_results(self):
+        for _ in range(25):
+            self._call()
+
+        listing = self.client.get('/api/calls/')
+        export = self.client.get('/api/calls/export/')
+
+        self.assertEqual(len(listing.data['results']), 10)
+        self.assertEqual(len(self._rows(export)) - 1, 25)
+
+    def test_non_staff_export_only_contains_own_branch(self):
+        self._call(branch=self.dharan, notes='dharan-note')
+        self._call(branch=self.biratnagar, notes='birat-note')
+
+        self.client.force_authenticate(self.dharan_user)
+
+        for url in (
+            '/api/calls/export/',
+            f'/api/calls/export/?branch_id={self.biratnagar.id}',
+        ):
+            response = self.client.get(url)
+
+            self.assertEqual(response.status_code, 200)
+
+            notes = [
+                row[10]
+                for row in self._rows(response)[1:]
+            ]
+
+            self.assertEqual(notes, ['dharan-note'])
+
+    def test_export_query_count_is_fixed(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        def count_queries():
+            with CaptureQueriesContext(connection) as ctx:
+                response = self.client.get('/api/calls/export/')
+
+            self.assertEqual(response.status_code, 200)
+            return len(ctx)
+
+        for _ in range(2):
+            self._call(caller=str(self.staff.pk))
+
+        few = count_queries()
+
+        for _ in range(40):
+            self._call(caller=str(self.staff.pk))
+
+        self.assertEqual(count_queries(), few)
