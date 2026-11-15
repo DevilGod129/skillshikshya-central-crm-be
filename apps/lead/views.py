@@ -1,7 +1,7 @@
 import csv
 
 from django.contrib.auth import get_user_model
-from django.db.models import ( Count, Q , Sum )
+from django.db.models import Count, Q , Sum
 from django.db.models.functions import TruncDate
 from django.http import HttpResponse
 from django.utils import timezone
@@ -14,6 +14,7 @@ from rest_framework.response import Response
 
 from django_filters.rest_framework import DjangoFilterBackend
 
+from apps.callminutes.utils import format_duration
 from apps.lead.tasks import NEPAL_TZ
 from apps.lead.models import (
     LearningMode, Institution, Province, City, LeadSource, Campaign, LeadStatus, LeadPriority,
@@ -301,8 +302,8 @@ def resolve_caller_names(caller_values):
     already names and can be displayed as they are.
     """
     ids = {
-    int(v) for v in caller_values
-    if v and str(v).isascii() and str(v).isdigit() and len(str(v)) <= 9
+        int(v) for v in caller_values
+        if v and str(v).isascii() and str(v).isdigit() and len(str(v)) <= 9
     }
     if not ids:
         return {}
@@ -361,7 +362,6 @@ class GlobalCallViewSet(viewsets.ReadOnlyModelViewSet):
             .order_by('day')
         )
 
-        
         caller_rows = list(
             qs.values('caller')
             .annotate(count=Count('id'))
@@ -398,6 +398,71 @@ class GlobalCallViewSet(viewsets.ReadOnlyModelViewSet):
             ],
             'top_callers': top_callers,
         })
+
+    @action(detail=False, methods=['get'])
+    def export(self, request):
+        qs = self.filter_queryset(self.get_queryset())
+
+        caller_names = resolve_caller_names(
+            list(
+                qs.order_by()
+                .values_list('caller', flat=True)
+                .distinct()
+            )
+        )
+
+        today = timezone.now().astimezone(NEPAL_TZ).strftime('%Y-%m-%d')
+
+        response = HttpResponse(
+            content_type='text/csv; charset=utf-8'
+        )
+        response['Content-Disposition'] = (
+            f'attachment; filename="calls-{today}.csv"'
+        )
+
+        # UTF-8 BOM helps Excel display Nepali/Devanagari text correctly.
+        response.write('\ufeff')
+
+        writer = csv.writer(response)
+
+        writer.writerow([
+            'Date & time (NPT)',
+            'Direction',
+            'Lead',
+            'Reference',
+            'Phone',
+            'Caller',
+            'Logged by',
+            'Duration (MM:SS)',
+            'Seconds',
+            'Outcome',
+            'Notes',
+            'Recording',
+        ])
+
+        for call in qs.iterator(chunk_size=500):
+            writer.writerow([
+                call.call_timestamp.astimezone(NEPAL_TZ).strftime(
+                    '%Y-%m-%d %H:%M:%S'
+                ),
+                call.get_direction_display(),
+                csv_safe(call.lead.full_name),
+                csv_safe(call.lead.reference_number),
+                csv_safe(call.phone_number),
+                csv_safe(
+                    caller_names.get(call.caller, call.caller)
+                ),
+                csv_safe(
+                    call.created_by.name if call.created_by else ''
+                ),
+                format_duration(call.duration_seconds),
+                call.duration_seconds,
+                csv_safe(call.outcome),
+                csv_safe(call.notes),
+                csv_safe(call.recording_url),
+            ])
+
+        return response
 
 
 class NotificationViewSet(viewsets.ModelViewSet):
