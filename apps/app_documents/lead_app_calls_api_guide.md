@@ -273,4 +273,6 @@ GET /api/leads/1/calls/?ordering=-call_timestamp
 
 ---
 
+## DELETE `/api/leads/{lead_id}/calls/{id}/` — Delete Call
+
 **Response:** `405 Method Not Allowed` — call records cannot be deleted.

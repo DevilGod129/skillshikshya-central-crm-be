@@ -767,3 +767,97 @@ class GlobalCallExportTests(APITestCase):
             self._call(caller=str(self.staff.pk))
 
         self.assertEqual(count_queries(), few)
+
+    def test_leading_whitespace_formulas_are_neutralised(self):
+        for note in [' =1+1', '\n=1+1']:
+            self._call(notes=note)
+
+        cells = [
+            row[10]
+            for row in self._rows(
+                self.client.get('/api/calls/export/')
+            )[1:]
+        ]
+
+        self.assertEqual(len(cells), 2)
+
+        for cell in cells:
+            self.assertTrue(cell.startswith("'"), cell)
+
+
+    def test_real_phone_numbers_are_not_prefixed(self):
+        from apps.lead.models import LeadCall
+
+        call = self._call()
+        LeadCall.objects.filter(pk=call.pk).update(
+            phone_number='+9779800000000'
+        )
+
+        row = self._rows(
+            self.client.get('/api/calls/export/')
+        )[1]
+
+        self.assertEqual(row[4], '+9779800000000')
+        
+class LeadCallBranchOnCreateTests(APITestCase):
+    """A call logged through the API must be findable by its branch."""
+
+    def test_logged_call_inherits_lead_branch_and_is_scoped(self):
+        from apps.branch.models import Branch
+        from apps.lead.models import LeadCall
+
+        dharan = Branch.objects.create(name='Dharan', code='DHR')
+        biratnagar = Branch.objects.create(name='Biratnagar', code='BRT')
+
+        staff = User.objects.create_user(
+            email='create-staff@test.com',
+            name='Create Staff',
+            password='pass',
+            is_staff=True,
+        )
+
+        dharan_user = User.objects.create_user(
+            email='create-dharan@test.com',
+            name='Create Dharan',
+            password='pass',
+            branch=dharan,
+        )
+
+        birat_user = User.objects.create_user(
+            email='create-birat@test.com',
+            name='Create Birat',
+            password='pass',
+            branch=biratnagar,
+        )
+
+        lead = Lead.objects.create(
+            full_name='Branch Lead',
+            phone='9899999999',
+            branch=dharan,
+        )
+
+        self.client.force_authenticate(staff)
+
+        response = self.client.post(
+            f'/api/leads/{lead.id}/calls/',
+            {
+                'call_timestamp': '2026-11-15T10:00:00Z',
+                'direction': 'outbound',
+                'caller': str(staff.pk),
+                'phone_number': '9899999999',
+                'duration_seconds': 0,
+            },
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(
+            LeadCall.objects.get(pk=response.data['id']).branch_id,
+            dharan.id,
+        )
+
+        self.client.force_authenticate(dharan_user)
+        self.assertEqual(self.client.get('/api/calls/').data['count'], 1)
+
+        self.client.force_authenticate(birat_user)
+        self.assertEqual(self.client.get('/api/calls/').data['count'], 0)

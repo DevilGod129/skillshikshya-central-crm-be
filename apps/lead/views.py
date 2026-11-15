@@ -1,5 +1,7 @@
 import csv
+import re
 
+from django.shortcuts import get_object_or_404
 from django.contrib.auth import get_user_model
 from django.db.models import Count, Q , Sum
 from django.db.models.functions import TruncDate
@@ -282,18 +284,24 @@ class GlobalPaymentViewSet(viewsets.ReadOnlyModelViewSet):
         return [IsAuthenticated(), IsStaffOrHasPermission()]
 
 
-CSV_FORMULA_PREFIXES = ('=', '+', '-', '@', '\t', '\r')
+FORMULA_TRIGGERS = ('=', '+', '-', '@')
+PHONE_LIKE = re.compile(r'^\+?\d[\d\s()-]{3,18}\d$')
 
 
-def csv_safe(value):
-    """Stop spreadsheet apps from running a text cell as a formula."""
+def csv_safe(value, allow_phone=False):
+    """Stop spreadsheet apps from running a text cell as a formula.
+
+    Checks the first non-whitespace character, so " =1+1" and "\\n=1+1" are
+    caught too. Real phone numbers are left alone when `allow_phone` is set.
+    """
     if value is None:
         return ''
     text = str(value)
-    if text.startswith(CSV_FORMULA_PREFIXES):
+    if allow_phone and PHONE_LIKE.match(text):
+        return text
+    if text.lstrip().startswith(FORMULA_TRIGGERS) or text.startswith(('\t', '\r')):
         return "'" + text
     return text
-
 
 def resolve_caller_names(caller_values):
     """Map caller values to display names.
@@ -448,7 +456,7 @@ class GlobalCallViewSet(viewsets.ReadOnlyModelViewSet):
                 call.get_direction_display(),
                 csv_safe(call.lead.full_name),
                 csv_safe(call.lead.reference_number),
-                csv_safe(call.phone_number),
+                csv_safe(call.phone_number,allow_phone=True),
                 csv_safe(
                     caller_names.get(call.caller, call.caller)
                 ),
@@ -684,14 +692,24 @@ class LeadCallViewSet(viewsets.ModelViewSet):
     def perform_create(self, serializer):
         from apps.callminutes.services import charge_for_call
 
+        parent = get_object_or_404(Lead, pk=self.kwargs['lead_pk'])
+
+        # Calls inherit the lead's branch, otherwise the logger's branch.
+        branch = (
+            parent.branch
+            or getattr(self.request.user, 'branch', None)
+        )
+
         instance = charge_for_call(
             user=self.request.user,
             duration_seconds=serializer.validated_data.get('duration_seconds'),
             create_call=lambda: serializer.save(
                 lead_id=self.kwargs['lead_pk'],
                 created_by=self.request.user,
+                branch=branch,
             ),
         )
+
         lead = instance.lead
         if lead.last_contact_at is None or instance.call_timestamp > lead.last_contact_at:
             lead.last_contact_at = instance.call_timestamp
